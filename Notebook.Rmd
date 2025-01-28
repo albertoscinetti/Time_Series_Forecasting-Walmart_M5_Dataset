@@ -1,0 +1,805 @@
+---
+header-includes:
+- \usepackage{xcolor}
+- \usepackage{color} 
+- \usepackage{fancyhdr,color}
+- \usepackage{lipsum}
+- \fancyfoot[CE] {\thepage}
+title: "**Final Project AFCS \n &nbsp;  \n Team 1**"
+subtitle: "Applied Forecasting in Complex Systems 2024"
+author: Alberto Scinetti (13115316), Rosa Keuss (12690589), Ngoc Doan (11576057)
+Simon Hüsgen (15215555), and Pearl Owusu (12502340)
+date: "University of Amsterdam \n &nbsp;  \n December, 20, 2024 "
+output: pdf_document
+fontsize: 11pt
+highlight: tango
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = TRUE,
+  dev.args = list(pointsize = 11)
+)
+options(digits = 3, width = 60)
+library(fpp3)
+library(latex2exp)
+library(tidyverse)
+library(prophet)
+library(tsibble)
+```
+
+## Data Description / Exploration
+
+The data set "sales" ("sales_train_and_validation") includes 823 products from the "FOODS_3" category (assumed to be category Food and Department 3) sold by a Walmart store uniquely identified as "TX3" in Texas (US) for the subsequent 1912 days ( $\approx$ 5 years and 3 months) starting on 2011-01-29. Each product within this category is uniquely identified by a code, such as "FOODS_3_007".
+
+The "calendar" data set contains the information about the dates the product are sold, information that might be useful for modelling future sales based on weekday/weekend/event day.
+
+The "sell_prices" data set contains information about the price of the products sold per store and date (also might be useful to include this in the model but maybe less important than date? not sure)
+
+Other data sets are for testing and evaluation.
+
+*Importing the data sets:*
+
+```{r}
+calendar <- read.csv("calendar_afcs2024.csv")
+sell_prices <- read.csv("sell_prices_afcs2024.csv")
+sales_train_and_validation <- read.csv("sales_train_validation_afcs2024.csv")
+sales_test_and_validation <- read.csv("sales_test_validation_afcs2024.csv") 
+#sample_submission <- read.csv("sample_submission_afcs2024.csv")
+sales_test_and_evaluation <- read.csv("sales_test_evaluation_afcs_2024.csv") 
+
+# How many products to make forecast on? 823 
+print(nrow(sales_train_and_validation))
+print(nrow(sales_test_and_validation))
+```
+
+*Convert main sales data to a tsibble object and visualize number of stock sold per day for a product.*
+
+In this case we visualize number of products sold over the time span for product FOODS_3_001 and FOODS_3_007.
+
+Note that different products have different fluctuation, different distribution and different peaks (like product 007 is sold in such a higher quantity than product 001)
+
+```{r}
+# we convert the prediction object into a tsibble 
+
+df_long_sales <- sales_train_and_validation %>%
+  pivot_longer(cols = starts_with("d_"), 
+               names_to = "day", 
+               values_to = "items_sold") %>%
+  mutate(day = as.integer(sub("d_", "", day))) 
+
+
+df_long_sales <- df_long_sales %>%
+  mutate(date = as.Date("2011-01-29") + days(day - 1))  
+
+df_sales_tsibble <- df_long_sales %>%
+  as_tsibble(index = date, key = id)
+
+```
+
+```{r}
+# also add calendar features to the training data (day of the week, month, holiday and snap )
+calendar <- calendar %>%
+  mutate(date = as.Date(date, format = "%m/%d/%Y"))
+
+# holiday indicator 
+calendar <- calendar  %>%
+  mutate(
+    is_holiday = ifelse(!is.na(event_name_1) | !is.na(event_name_2), 1, 0),
+    holiday_type = coalesce(event_type_1, event_type_2)  # Combine types into one column
+  )
+
+# merge 
+df_merged <- df_long_sales %>%
+  left_join(calendar %>% select(date, weekday, month, is_holiday, holiday_type, snap_TX), by = "date")
+
+df_merged_tsibble <- df_merged %>%
+  as_tsibble(index = date, key = id)
+
+df_merged_tsibble 
+```
+
+```{r}
+# visualize some data for some days
+df_merged_tsibble  %>% 
+  filter(id =="FOODS_3_001_TX_3_validation") %>%
+  autoplot(items_sold)
+
+df_merged_tsibble %>% 
+  filter(id == "FOODS_3_090_TX_3_validation") %>%
+  autoplot(items_sold) +
+  labs(
+    title = "Distribution of Product TX 090",
+    x = "Date",
+    y = "Items Sold"
+  )
+
+```
+
+Now we explore the sell prices data set
+
+*Need to add a visualization to see how sell prices data is missing a lot of values*
+
+```{r}
+
+start_date <- as.Date("2011-01-29")
+
+# add daily sell price using weekly data
+sell_prices <- sell_prices %>%
+  mutate(week_start_date = start_date + weeks(wm_yr_wk - min(wm_yr_wk)))
+
+# tsibble conv
+data_sell_tsibble <- sell_prices %>%
+  as_tsibble(index = week_start_date, key = c(store_id, item_id))
+
+data_sell_tsibble <- data_sell_tsibble %>%
+  mutate(item_id = paste0(item_id, "_TX_3_validation"))
+
+
+
+
+# to daily data 
+data_sell_daily <- data_sell_tsibble %>%
+  mutate(date = map(week_start_date, ~ seq.Date(.x, by = "day", length.out = 7))) %>%
+  unnest(cols = c(date))
+
+data_sell_daily 
+```
+
+```{r}
+# View the resulting tsibble
+data_sell_tsibble%>% 
+  filter(item_id == "FOODS_3_001_TX_3_validation") %>%
+  autoplot(sell_price)
+
+
+data_sell_tsibble %>% 
+  filter(item_id == "FOODS_3_007_TX_3_validation") %>%
+  autoplot(sell_price)
+
+```
+
+```{r}
+
+# List of products to analyze
+products <- c("FOODS_3_001_TX_3_validation", "FOODS_3_002_TX_3_validation",  "FOODS_3_090_TX_3_validation","FOODS_3_777_TX_3_validation", "FOODS_3_500_TX_3_validation", "FOODS_3_352_TX_3_validation",  "FOODS_3_620_TX_3_validation")
+
+# Generate a complete sequence of weekly start dates
+all_weeks <- tibble(
+  week_start_date = seq(
+    from = min(data_sell_tsibble$week_start_date),
+    to = max(data_sell_tsibble$week_start_date),
+    by = "week"
+  )
+)
+
+# Function to process and visualize missing weeks for each product
+process_product <- function(product_id) {
+  # Filter data for the specific product
+  filtered_data <- data_sell_tsibble %>%
+    filter(item_id == product_id)
+  
+  # Join the complete sequence with the filtered data
+  missing_weeks_data <- all_weeks %>%
+    left_join(filtered_data, by = "week_start_date") %>%
+    mutate(
+      status = ifelse(is.na(sell_price), "Missing", "Present"),
+      item_id = product_id  # Add product identifier
+    )
+  
+  return(missing_weeks_data)
+}
+
+# Process all products and combine the results
+missing_data_combined <- bind_rows(lapply(products, process_product))
+
+# Visualization
+ggplot(missing_data_combined, aes(x = week_start_date, y = item_id, color = status)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("Present" = "blue", "Missing" = "red")) +
+  labs(
+    title = "Missing Weeks Visualization for Multiple Products",
+    x = "Week Start Date",
+    y = "Product",
+    color = "Week Status"
+  ) +
+  theme_minimal()
+
+# Process all products and combine the results
+missing_data_combined <- bind_rows(lapply(products, process_product))
+
+# Visualization
+ggplot(missing_data_combined, aes(x = week_start_date, y = item_id, color = status)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("Present" = "blue", "Missing" = "red")) +
+  labs(
+    title = "Missing Weeks Visualization for Multiple Products",
+    x = "Week Start Date",
+    y = "Product",
+    color = "Week Status"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+# convert weekly sell price to daily 
+data_sell_daily <- data_sell_daily %>%
+  select(date, item_id, sell_price)
+
+# merge
+df_merged_tsibble <- df_merged_tsibble %>%
+  left_join(data_sell_daily, by = c("date", "id" = "item_id"))
+
+df_merged_tsibble
+```
+
+```{r}
+# look at sales heatmpat 
+df_sales_tsibble %>%
+  mutate(month = format(date, "%b"),  
+         day_of_week = weekdays(date)) %>%  
+  group_by(month, day_of_week) %>% 
+  summarise(total_sales = sum(items_sold, na.rm = TRUE)) %>% 
+  ggplot(aes(x = month, y = day_of_week, fill = total_sales)) +
+  geom_tile() +  
+  labs(title = "Sales Heatmap by Day of Week and Month", 
+       x = "Month", 
+       y = "Day of Week", 
+       fill = "Total Sales") +
+  scale_fill_viridis_c() + 
+  theme_minimal() 
+
+```
+
+more data analysis
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Unique events
+unique_events <- calendar %>%
+  select(event_name_1, event_name_2) %>%
+  summarise(
+    unique_event_1 = n_distinct(event_name_1, na.rm = TRUE),
+    unique_event_2 = n_distinct(event_name_2, na.rm = TRUE)
+  )
+print(unique_events)
+
+# Unique event types
+unique_event_types <- calendar %>%
+  select(event_type_1, event_type_2) %>%
+  summarise(
+    unique_event_type_1 = n_distinct(event_type_1, na.rm = TRUE),
+    unique_event_type_2 = n_distinct(event_type_2, na.rm = TRUE)
+  )
+print(unique_event_types)
+
+# Distribution of days (weekday, month, year)
+weekday_distribution <- calendar %>%
+  count(weekday) %>%
+  arrange(desc(n))
+print(weekday_distribution)
+
+month_distribution <- calendar %>%
+  count(month) %>%
+  arrange(month)
+print(month_distribution)
+
+year_distribution <- calendar %>%
+  count(year) %>%
+  arrange(year)
+print(year_distribution)
+
+# Distribution of the event types 
+event_type_1_distribution <- calendar %>%
+  count(event_type_1) %>%
+  arrange(desc(n))
+print(event_type_1_distribution)
+
+event_type_2_distribution <- calendar %>%
+  count(event_type_2) %>%
+  arrange(desc(n))
+print(event_type_2_distribution)
+
+# Event by weekday
+event_by_weekday <- calendar %>%
+  group_by(weekday) %>%
+  summarise(
+    event_1_count = sum(!is.na(event_name_1)),
+    event_2_count = sum(!is.na(event_name_2)),
+    .groups = "drop"
+  ) %>%
+  arrange(weekday)
+print(event_by_weekday)
+
+# other variables
+snap_distribution <- calendar %>%
+  count(snap_TX) %>%
+  arrange(snap_TX)
+print(snap_distribution)
+
+# Plots
+ggplot(weekday_distribution, aes(x = reorder(weekday, -n), y = n)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Distribution of Days of the Week", x = "Weekday", y = "Count") +
+  theme_minimal()
+
+ggplot(month_distribution, aes(x = as.factor(month), y = n)) +
+  geom_bar(stat = "identity", fill = "lightgreen") +
+  labs(title = "Distribution of Months", x = "Month", y = "Count") +
+  theme_minimal()
+
+ggplot(event_type_1_distribution, aes(x = reorder(event_type_1, -n), y = n)) +
+  geom_bar(stat = "identity", fill = "lightcoral") +
+  labs(title = "Distribution of Event Types (Type 1)", x = "Event Type", y = "Count") +
+  theme_minimal()
+
+ggplot(event_type_2_distribution, aes(x = reorder(event_type_2, -n), y = n)) +
+  geom_bar(stat = "identity", fill = "lightyellow") +
+  labs(title = "Distribution of Event Types (Type 2)", x = "Event Type", y = "Count") +
+  theme_minimal()
+```
+
+STL decomposition for an item
+
+```{r}
+library(forecast)
+#one product
+df_foods_001 <- df_sales_tsibble %>%
+  filter(id == "FOODS_3_090_TX_3_validation")
+
+#daily
+ts_foods_001 <- ts(df_foods_001$items_sold, frequency = 365)
+
+#STL decomposition
+fit_stl <- stl(ts_foods_001, s.window = "periodic")
+autoplot(fit_stl) +
+  labs(
+    title = "STL Decomposition of Product TX 090",
+    x = "Date",
+    y = "Items Sold"
+  )
+
+
+```
+
+Correlation between prices and sales for an item
+
+```{r}
+#Merge sales and price for an item
+merged_data <- df_sales_tsibble %>%
+  filter(id == "FOODS_3_001_TX_3_validation") %>%
+  left_join(data_sell_tsibble %>% filter(item_id == "FOODS_3_001_TX_3_validation"),
+            by = c("date" = "week_start_date"))
+
+#Correlation sales and price: 0.0469 for 001
+cor(merged_data$sell_price, merged_data$items_sold, use = "complete.obs")
+```
+
+# Forecast Analysis (on single product)
+
+```{r}
+# mutate values to use for analys as factors to be sure they're good for analysis 
+df_merged_tsibble <- df_merged_tsibble %>%
+  mutate(weekday = factor(weekday, levels = c("Sunday", "Monday", "Tuesday", 
+                                              "Wednesday", "Thursday", "Friday", 
+                                              "Saturday")))
+```
+
+```{r}
+#Convert Validation Data to Long Format
+validation_tsibble <- sales_test_and_evaluation %>%
+  pivot_longer(
+    cols = starts_with("d_"),
+    names_to = "day",
+    values_to = "items_sold"
+  ) %>%
+  mutate(
+    day = as.integer(sub("d_", "", day)),
+    date = as.Date("2016-04-24") + (day - 1942)  # Adjust starting date
+  ) %>%
+  select(-day) %>%
+  as_tsibble(index = date, key = id)
+
+```
+
+```{r}
+
+# Create a tsibble for the next 28 days
+future_dates <- tibble(
+  date = seq.Date(
+    from = max(df_merged_tsibble$date) + 1,
+    by = "day",
+    length.out = 28
+  )
+) %>%
+  mutate(
+    weekday = factor(weekdays(date), levels = c("Sunday", "Monday", "Tuesday", 
+                                                "Wednesday", "Thursday", "Friday", 
+                                                "Saturday")),
+    #month = factor(month(date), levels = as.character(1:12))
+  )
+
+# Add the ID to align with the model's key
+future_tsibble <- future_dates %>%
+  mutate(id = "FOODS_3_090_TX_3_validation") %>%
+  as_tsibble(index = date, key = id)
+```
+
+```{r}
+future_tsibble <- future_tsibble %>%
+  left_join(calendar %>% select(date, month, is_holiday, snap_TX), by = "date")
+
+future_tsibble <- future_tsibble %>%
+  left_join(data_sell_daily, by = c("date", "id" = "item_id"))
+
+future_tsibble 
+```
+
+```{r}
+#install.packages("fable.prophet")
+library(fable.prophet)
+```
+
+```{r}
+# Fit ARIMA model with covariates
+models <- df_merged_tsibble %>%
+  filter(id == "FOODS_3_090_TX_3_validation") %>%
+  model(
+    ARIMA = ARIMA(items_sold),
+    ARIMA1 = ARIMA(items_sold~ weekday + snap_TX + is_holiday),
+    ARIMA2 = ARIMA(items_sold ~ weekday + snap_TX),
+    ETS = ETS(items_sold),
+    SNAIVE = SNAIVE(items_sold),
+    TSLM = TSLM(items_sold ~ trend() + season() + is_holiday + snap_TX),
+    PROPHET = prophet(items_sold ~ weekday + is_holiday + snap_TX)
+  )
+
+# Forecast using the future tsibble for all models
+forecasts <- models %>%
+  forecast(new_data = future_tsibble)
+
+# Clip negative predictions and round to integers
+forecasts <- forecasts %>%
+  mutate(
+    .mean = pmax(0, round(.mean))
+  )
+
+# Plot forecasts for all models
+forecasts %>%
+  autoplot(df_merged_tsibble %>% filter(id == "FOODS_3_090_TX_3_validation")) +
+  labs(title = "Forecast Comparison", y = "Items Sold", x = "Date") +
+  facet_wrap(~.model, scales = "free_y")  # Separate plot for each model
+
+
+```
+
+```{r}
+# Join forecasts with validation data
+results_comparison <- forecasts %>%
+  as_tibble() %>%
+  select(.model, id, date, forecast = .mean) %>%
+  left_join(
+    validation_tsibble,  # Validation data containing actual sales
+    by = c("id", "date")
+  )
+
+```
+
+```{r}
+# Calculate error metrics for each model
+results_comparison <- results_comparison %>%
+  mutate(
+    error = abs(forecast - items_sold)  # Absolute error
+  )
+
+# MAE and RMSE by model
+metrics <- results_comparison %>%
+  group_by(.model) %>%
+  summarise(
+    MAE = mean(error, na.rm = TRUE),
+    RMSE = sqrt(mean(error^2, na.rm = TRUE))
+  )
+
+# Print metrics
+print(metrics)
+
+```
+
+```{r}
+# Plot forecasts vs actuals for each model
+results_comparison %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = items_sold, color = "Actual"), size = 1) +
+  geom_line(aes(y = forecast, color = .model), linetype = "dashed") +
+  facet_wrap(~.model, scales = "free_y") +
+  labs(
+    title = "Forecast vs Actuals by Model",
+    y = "Items Sold",
+    x = "Date"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Plot residual diagnostics for all models
+models %>%
+  select(ARIMA2) %>%
+  gg_tsresiduals()
+
+```
+
+## **A biggest Forecast sample for validation**
+
+```{r}
+sample_ids <- df_merged_tsibble %>%
+  distinct(id) %>%
+  slice_sample(n = 20) %>% # Adjust `n` for the number of products you want
+  pull(id)
+sample_ids
+
+sampled_data <- df_merged_tsibble %>%
+  filter(id %in% sample_ids)
+
+sample_ids 
+
+```
+
+```{r}
+# atsibble for the next 28 days
+future_dates <- tibble(
+  date = seq.Date(
+    from = max(df_merged_tsibble$date) + 1,
+    by = "day",
+    length.out = 28
+  )
+) %>%
+  mutate(
+    weekday = factor(weekdays(date), levels = c("Sunday", "Monday", "Tuesday", 
+                                                "Wednesday", "Thursday", "Friday", 
+                                                "Saturday"))
+  )
+
+# the sampled IDs to align with the model's key
+future_tsibble <- expand_grid(
+  date = future_dates$date,
+  id = sample_ids  
+) %>%
+  left_join(future_dates, by = "date") %>% 
+  as_tsibble(index = date, key = id)
+
+future_tsibble <- future_tsibble %>%
+  left_join(calendar %>% select(date, month, is_holiday, snap_TX), by = "date")
+
+future_tsibble <- future_tsibble %>%
+  left_join(data_sell_daily, by = c("date", "id" = "item_id"))
+
+future_tsibble 
+```
+
+```{r}
+models_sampled <- sampled_data %>%
+  model(
+    ARIMA = ARIMA(items_sold),
+    ARIMA1 = ARIMA(items_sold ~ weekday + snap_TX + is_holiday),
+    ARIMA2 = ARIMA(items_sold ~ weekday + snap_TX),
+    ETS = ETS(items_sold),
+    SNAIVE = SNAIVE(items_sold),
+    TSLM = TSLM(items_sold ~ trend() + season() + weekday + is_holiday + snap_TX),
+    PROPHET = prophet(items_sold ~ weekday +  snap_TX)
+  )
+
+
+forecasts_sampled <- models_sampled %>%
+  forecast(new_data = future_tsibble %>%
+             filter(id %in% sample_ids))
+
+
+```
+
+```{r}
+# Join forecasts with validation data
+results_comparison <- forecasts_sampled %>%
+  as_tibble() %>%
+  select(.model, id, date, forecast = .mean) %>%
+  left_join(
+    validation_tsibble,  # Validation data containing actual sales
+    by = c("id", "date")
+  )
+
+# Calculate error metrics for each model and product
+results_comparison <- results_comparison %>%
+  mutate(
+    error = abs(forecast - items_sold)  
+  )
+
+# MAE and RMSE 
+metrics <- results_comparison %>%
+  group_by(.model, id) %>%
+  summarise(
+    MAE = mean(error, na.rm = TRUE),
+    RMSE = sqrt(mean(error^2, na.rm = TRUE)),
+    .groups = 'drop' 
+  )
+
+print(metrics)
+```
+
+```{r}
+# Aggregate metrics by model across all products
+aggregate_metrics <- metrics %>%
+  group_by(.model) %>%
+  summarise(
+    MAE = mean(MAE, na.rm = TRUE),
+    RMSE = mean(RMSE, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Print aggregate metrics
+print(aggregate_metrics)
+```
+
+# Final Model
+
+Since ARIMA2 model scored best it will be applied to the whole data set.
+
+```{r}
+
+all_ids <- df_merged_tsibble %>%
+  distinct(id) %>%
+  pull(id)
+
+
+future_dates <- tibble(
+  date = seq.Date(
+    from = max(df_merged_tsibble$date) + 1,
+    by = "day",
+    length.out = 28
+  )
+) %>%
+  mutate(
+    weekday = factor(weekdays(date), levels = c("Sunday", "Monday", "Tuesday", 
+                                                "Wednesday", "Thursday", "Friday", 
+                                                "Saturday"))
+  )
+
+# Add the sampled IDs to align with the model's key
+future_tsibble <- expand_grid(
+  date = future_dates$date,
+  id = all_ids  # Include the sampled product IDs here
+) %>%
+  left_join(future_dates, by = "date") %>%  # Add the weekday column to the grid
+  as_tsibble(index = date, key = id)
+
+future_tsibble <- future_tsibble %>%
+  left_join(calendar %>% select(date, month, is_holiday, snap_TX), by = "date")
+
+future_tsibble <- future_tsibble %>%
+  left_join(data_sell_daily, by = c("date", "id" = "item_id"))
+
+future_tsibble 
+```
+
+```{r}
+final_model <- df_merged_tsibble %>%
+  model(
+    ARIMA(items_sold ~ weekday + snap_TX),
+  )
+
+
+forecasts_final <- final_model %>%
+  forecast(new_data = future_tsibble %>%
+             filter(id %in% all_ids))
+
+forecasts_final
+```
+
+```{r}
+# normalise forecast to int 
+forecasts_final <- forecasts_final %>%
+  mutate(
+    .mean = pmax(0, round(.mean))
+  )
+
+# Join forecasts with validation data
+results_comparison_final <- forecasts_final %>%
+  as_tibble() %>%
+  select(.model, id, date, forecast = .mean) %>%
+  left_join(
+    validation_tsibble,  
+    by = c("id", "date")
+  )
+
+```
+
+```{r}
+# Calculate error metrics for each model and product
+results_comparison_final <- results_comparison_final %>%
+  mutate(
+    error = abs(forecast - items_sold) 
+  )
+
+# MAE and RMSE 
+metrics <- results_comparison_final %>%
+  group_by(.model, id) %>%
+  summarise(
+    MAE = mean(error, na.rm = TRUE),
+    RMSE = sqrt(mean(error^2, na.rm = TRUE)),
+    .groups = 'drop'  # Prevent grouped data frame issues
+  )
+
+print(metrics)
+```
+
+```{r}
+# Aggregate metrics by model across all products
+aggregate_metrics <- metrics %>%
+  group_by(.model) %>%
+  summarise(
+    MAE = mean(MAE, na.rm = TRUE),
+    RMSE = mean(RMSE, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Print aggregate metrics
+print(aggregate_metrics)
+```
+
+```{r}
+# Aggregate residuals
+residuals_aggregate <- final_model %>%
+  residuals() %>%
+  as_tibble() %>%
+  group_by(date) %>%
+  summarise(
+    mean_residual = mean(.resid, na.rm = TRUE),
+    sd_residual = sd(.resid, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Visualize aggregate residuals over time
+ggplot(residuals_aggregate, aes(x = date, y = mean_residual)) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Mean Residuals Over Time", x = "Date", y = "Mean Residual")
+
+```
+
+```{r}
+# convert forecast in rigth sumbissimon format
+# Transform `forecasts_final` into wide format
+
+# Add a column cycling from F1 to F28
+forecasts_submission <- forecasts_final %>%
+  as_tibble() %>%  # Convert the fable to a tibble
+  select(id, date, .mean) %>%  # Select relevant columns
+  group_by(id) %>%  # Group by `id` to restart the cycle for each product
+  mutate(F_day = paste0("F", rep(1:28, length.out = n()))) %>%
+  ungroup()  # Ungroup after mutation
+
+# View the result
+print(forecasts_submission)
+```
+
+```{r}
+# Pivot the tibble into the desired format
+forecasts_wide <- forecasts_submission %>%
+  select(id, F_day, .mean) %>%  # Keep only relevant columns
+  pivot_wider(names_from = F_day, values_from = .mean)
+
+# View the resulting tibble
+print(forecasts_wide)
+
+# Save the forecasts_wide data frame as a CSV file
+write.csv(forecasts_wide, "final_submission.csv", row.names = FALSE)
+
+```
