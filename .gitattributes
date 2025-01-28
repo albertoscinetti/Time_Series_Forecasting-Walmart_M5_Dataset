@@ -1,0 +1,9 @@
+# Mark R markdown files explicitly as R
+*.Rmd linguist-language=R
+
+# Exclude non-code files from language statistics
+.DS_Store linguist-detectable=false
+.Rhistory linguist-detectable=false
+
+# Exclude data files from language statistics
+*.csv linguist-detectable=false
